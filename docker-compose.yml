@@ -45,7 +45,7 @@ services:
 
   app:
     build: ./app
-    image: wolcom-app:0.4.1
+    image: wolcom-app:0.4.4
     restart: unless-stopped
     environment:
       PORT: 3000
@@ -86,7 +86,7 @@ services:
 
   updater:
     build: ./updater
-    image: wolcom-updater:0.4.1
+    image: wolcom-updater:0.4.2
     restart: unless-stopped
     environment:
       WOLCOM_INSTALL_DIR: ${WOLCOM_INSTALL_DIR:-/opt/wolcom}

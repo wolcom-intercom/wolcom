@@ -345,6 +345,7 @@ app.get('/api/hq/github',requireHq,async(_q,r)=>{try{const [open_source,cloud]=a
 app.post('/api/hq/github',requireHq,async(req,res)=>{try{res.json(await updaterFetch('/api/config/github',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(req.body)}))}catch(e){res.status(e.status||500).json({error:e.message})}});
 app.post('/api/hq/github/sync',requireHq,async(req,r)=>{try{r.json(await updaterFetch('/api/github/sync',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({target:req.body?.target||'cloud'})}))}catch(e){r.status(e.status||500).json({error:e.message})}});
 app.post('/api/hq/github/test',requireHq,async(req,r)=>{try{r.json(await updaterFetch('/api/github/test',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({target:req.body?.target||'cloud'})}))}catch(e){r.status(e.status||500).json({error:e.message})}});
+app.get('/api/hq/github/history',requireHq,async(req,r)=>{try{const target=String(req.query.target||'cloud');const limit=Math.max(1,Math.min(Number(req.query.limit)||50,200));r.json(await updaterFetch(`/api/github/history?target=${encodeURIComponent(target)}&limit=${limit}`))}catch(e){r.status(e.status||500).json({error:e.message})}});
 
 
 // Optional Wolcom Cloud commercial module. The public/self-host source export omits app/cloud entirely;
