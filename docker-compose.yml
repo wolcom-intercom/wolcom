@@ -1,0 +1,106 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - wolcom-db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [wolcom]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$${REDIS_PASSWORD}\""]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - wolcom-redis:/data
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" ping | grep PONG"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [wolcom]
+
+  livekit:
+    image: livekit/livekit-server:v1.13.5
+    restart: unless-stopped
+    network_mode: host
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  app:
+    build: ./app
+    image: wolcom-app:0.4.1
+    restart: unless-stopped
+    environment:
+      PORT: 3000
+      WOLCOM_VERSION: ${WOLCOM_VERSION}
+      WOLCOM_ADMIN_USER: ${WOLCOM_ADMIN_USER}
+      WOLCOM_ADMIN_PASSWORD: ${WOLCOM_ADMIN_PASSWORD}
+      WOLCOM_SESSION_SECRET: ${WOLCOM_SESSION_SECRET}
+      WOLCOM_UPDATER_URL: http://updater:8096
+      WOLCOM_UPDATER_TOKEN: ${WOLCOM_UPDATER_TOKEN}
+      WOLCOM_CLOUD_ENABLED: ${WOLCOM_CLOUD_ENABLED:-0}
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      PGHOST: db
+      PGPORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      LIVEKIT_URL: ${LIVEKIT_PUBLIC_URL}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET}
+    volumes:
+      - ./data:/data:ro
+    ports:
+      - "${WOLCOM_WEB_PORT}:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      updater:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:3000/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 30
+    networks: [wolcom]
+
+
+  updater:
+    build: ./updater
+    image: wolcom-updater:0.4.1
+    restart: unless-stopped
+    environment:
+      WOLCOM_INSTALL_DIR: ${WOLCOM_INSTALL_DIR:-/opt/wolcom}
+      WOLCOM_UPDATER_TOKEN: ${WOLCOM_UPDATER_TOKEN}
+    volumes:
+      - ${WOLCOM_INSTALL_DIR:-/opt/wolcom}:${WOLCOM_INSTALL_DIR:-/opt/wolcom}
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "127.0.0.1:${WOLCOM_UPDATER_PORT:-8096}:8096"
+    networks: [wolcom]
+
+networks:
+  wolcom:
+    driver: bridge
+volumes:
+  wolcom-db:
+  wolcom-redis:

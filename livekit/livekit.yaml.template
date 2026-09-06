@@ -1,0 +1,11 @@
+port: 7880
+log_level: info
+rtc:
+  tcp_port: 7881
+  udp_port: 7882
+  use_external_ip: true
+redis:
+  address: 127.0.0.1:6379
+  password: "__REDIS_PASSWORD__"
+keys:
+  __LIVEKIT_API_KEY__: "__LIVEKIT_API_SECRET__"

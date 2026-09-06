@@ -1,0 +1,12 @@
+{
+  "name": "wolcom",
+  "version": "0.4.1",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "express": "^5.1.0",
+    "livekit-client": "^2.15.6",
+    "livekit-server-sdk": "^2.13.1",
+    "pg": "^8.16.3"
+  }
+}
