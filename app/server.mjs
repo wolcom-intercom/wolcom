@@ -76,16 +76,16 @@ async function getHqUser(req){
   return rows[0]?.active?rows[0]:null;
 }
 function requireHq(req,res,next){getHqUser(req).then(u=>{if(!u)return res.status(401).json({error:'Unauthorized'});req.hqUser=u;next()}).catch(next)}
-function requireOwner(req,res,next){requireHq(req,res,()=>{if(req.hqUser?.role!=='owner')return res.status(403).json({error:'Owner-behörighet krävs'});next()})}
+function requireOwner(req,res,next){requireHq(req,res,()=>{if(req.hqUser?.role!=='owner')return res.status(403).json({error:'Owner permission required'});next()})}
 
 async function portalSession(req){
   const s=readSession(req,'wolcom_portal'); if(s?.type!=='portal'||!s.uid) return null;
-  const {rows}=await pool.query(`SELECT u.id,u.name,u.email,u.role,u.active,u.organization_id,o.name organization_name,o.slug organization_slug,o.active organization_active
+  const {rows}=await pool.query(`SELECT u.id,u.name,u.email,u.role,u.active,u.organization_id,o.name organization_name,o.slug organization_slug,o.customer_number organization_customer_number,o.active organization_active
     FROM users u JOIN organizations o ON o.id=u.organization_id WHERE u.id=$1`,[s.uid]);
   return rows[0]?.active&&rows[0]?.organization_active?rows[0]:null;
 }
 function requirePortal(req,res,next){portalSession(req).then(u=>{if(!u)return res.status(401).json({error:'Unauthorized'});req.portalUser=u;next()}).catch(next)}
-function requireCustomerAdmin(req,res,next){requirePortal(req,res,()=>{if(!['org_admin','customer_admin'].includes(req.portalUser?.role))return res.status(403).json({error:'Customer Admin-behörighet krävs'});next()})}
+function requireCustomerAdmin(req,res,next){requirePortal(req,res,()=>{if(!['org_admin','customer_admin'].includes(req.portalUser?.role))return res.status(403).json({error:'Customer Admin permission required'});next()})}
 function slugify(s){ return String(s||'').toLowerCase().trim().replace(/å/g,'a').replace(/ä/g,'a').replace(/ö/g,'o').replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'').slice(0,64); }
 function normalizeEmail(s){return String(s||'').trim().toLowerCase().slice(0,180)}
 function eventPayload(body){
@@ -95,7 +95,7 @@ function eventPayload(body){
 }
 async function createEvent(orgId,body,{bypassBilling=false}={}){
   const {name,slug,pin,channels}=eventPayload(body);
-  if(!bypassBilling){const gate=await cloudHooks.canCreateEvent(orgId);if(!gate?.ok){const e=new Error(gate?.error||'Planen tillåter inte nya event');e.status=402;throw e;}}
+  if(!bypassBilling){const gate=await cloudHooks.canCreateEvent(orgId);if(!gate?.ok){const e=new Error(gate?.error||'Your current plan does not allow creating new events');e.status=402;throw e;}}
   if(!name||!slug||pin.length<4) {const e=new Error('Name, slug and PIN (min 4 chars) are required');e.status=400;throw e;}
   const id=crypto.randomUUID();
   try{
@@ -167,6 +167,22 @@ async function initDb(){
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS organization_id uuid REFERENCES organizations(id) ON DELETE RESTRICT`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login timestamptz`);
   await pool.query(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS customer_number text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS organization_number text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS contact_name text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS contact_email text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS contact_phone text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS billing_email text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS billing_address text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS notes text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS plan text NOT NULL DEFAULT 'event'; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS subscription_status text NOT NULL DEFAULT 'manual'; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS max_events integer; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS max_participants integer;`);
+  await pool.query(`CREATE SEQUENCE IF NOT EXISTS wolcom_customer_number_seq START WITH 1001`);
+  const seqState=(await pool.query(`SELECT last_value,is_called FROM wolcom_customer_number_seq`)).rows[0];
+  const maxCustomer=(await pool.query(`SELECT COALESCE(MAX(CASE WHEN customer_number ~ '^WOL-[0-9]+$' THEN substring(customer_number from 5)::bigint END),1000) AS n FROM organizations`)).rows[0];
+  const seqAssigned=seqState?.is_called?Number(seqState.last_value):Number(seqState?.last_value||1001)-1;
+  await pool.query(`SELECT setval('wolcom_customer_number_seq',$1,true)`,[Math.max(1000,seqAssigned,Number(maxCustomer?.n||1000))]);
+  const missingCustomers=(await pool.query(`SELECT id FROM organizations WHERE kind='customer' AND COALESCE(NULLIF(trim(customer_number),''),'')='' ORDER BY created_at,id`)).rows;
+  for(const customer of missingCustomers){
+    const n=(await pool.query(`SELECT 'WOL-' || nextval('wolcom_customer_number_seq') AS customer_number`)).rows[0].customer_number;
+    await pool.query(`UPDATE organizations SET customer_number=$1 WHERE id=$2`,[n,customer.id]);
+  }
+  const duplicateCustomers=(await pool.query(`SELECT id FROM (SELECT id,row_number() OVER(PARTITION BY customer_number ORDER BY created_at,id) rn FROM organizations WHERE kind='customer' AND customer_number IS NOT NULL) q WHERE rn>1`)).rows;
+  for(const customer of duplicateCustomers){
+    const n=(await pool.query(`SELECT 'WOL-' || nextval('wolcom_customer_number_seq') AS customer_number`)).rows[0].customer_number;
+    await pool.query(`UPDATE organizations SET customer_number=$1 WHERE id=$2`,[n,customer.id]);
+  }
+  await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS organizations_customer_number_uq ON organizations(customer_number) WHERE customer_number IS NOT NULL`);
   let ir=await pool.query(`SELECT id FROM organizations WHERE slug='wolcom'`);
   let internalId=ir.rows[0]?.id;
   if(!internalId){internalId=crypto.randomUUID();await pool.query(`INSERT INTO organizations(id,name,slug,kind) VALUES($1,'Wolcom','wolcom','internal')`,[internalId]);}
@@ -181,6 +197,10 @@ async function initDb(){
   }
 }
 
+async function nextCustomerNumber(){
+  const {rows}=await pool.query(`SELECT 'WOL-' || nextval('wolcom_customer_number_seq') AS customer_number`);
+  return rows[0].customer_number;
+}
 
 const LOGO_MIMES=new Set(['image/png','image/jpeg','image/webp']);
 const FAVICON_MIMES=new Set(['image/png','image/x-icon','image/vnd.microsoft.icon']);
@@ -229,7 +249,16 @@ app.post('/api/portal/login',async (req,res)=>{
   res.json({ok:true});
 });
 app.post('/api/portal/logout',(_req,res)=>{res.setHeader('Set-Cookie','wolcom_portal=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0');res.json({ok:true})});
-app.get('/api/portal/me',async (req,res)=>{const u=await portalSession(req);res.json({authenticated:!!u,user:u?{id:u.id,name:u.name,email:u.email,role:u.role,organization:{id:u.organization_id,name:u.organization_name,slug:u.organization_slug}}:null,version})});
+app.get('/api/portal/me',async (req,res)=>{const u=await portalSession(req);res.json({authenticated:!!u,user:u?{id:u.id,name:u.name,email:u.email,role:u.role,organization:{id:u.organization_id,name:u.organization_name,slug:u.organization_slug,customer_number:u.organization_customer_number}}:null,version})});
+app.post('/api/portal/password',requirePortal,async(req,res)=>{
+  const currentPassword=String(req.body.current_password||''); const newPassword=String(req.body.new_password||'');
+  if(newPassword.length<8)return res.status(400).json({error:'New password must be at least 8 characters'});
+  const {rows}=await pool.query('SELECT password_hash FROM users WHERE id=$1',[req.portalUser.id]);
+  if(!rows[0]||!verifySecret(currentPassword,rows[0].password_hash))return res.status(403).json({error:'Current password is incorrect'});
+  if(verifySecret(newPassword,rows[0].password_hash))return res.status(400).json({error:'New password must be different from the current password'});
+  await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2',[hashSecret(newPassword),req.portalUser.id]);
+  res.json({ok:true});
+});
 app.get('/api/portal/events',requirePortal,async (req,res)=>{
   const {rows}=await pool.query(`SELECT e.id,e.name,e.slug,e.active,e.created_at,count(c.id)::int channel_count FROM events e LEFT JOIN channels c ON c.event_id=e.id WHERE e.organization_id=$1 GROUP BY e.id ORDER BY e.created_at DESC`,[req.portalUser.organization_id]);res.json(rows)
 });
@@ -258,26 +287,26 @@ app.get('/api/portal/users',requireCustomerAdmin,async(req,res)=>{
 });
 app.post('/api/portal/users',requireCustomerAdmin,async(req,res)=>{
   const name=String(req.body.name||'').trim().slice(0,100),email=normalizeEmail(req.body.email),password=String(req.body.password||''),role=String(req.body.role||'event_admin');
-  if(!name||!email||password.length<8)return res.status(400).json({error:'Namn, e-post och lösenord (minst 8 tecken) krävs'});
-  if(!['customer_admin','event_admin'].includes(role))return res.status(400).json({error:'Ogiltig kundroll'});
+  if(!name||!email||password.length<8)return res.status(400).json({error:'Name, email and password (minimum 8 characters) are required'});
+  if(!['customer_admin','event_admin'].includes(role))return res.status(400).json({error:'Invalid customer role'});
   try{const id=crypto.randomUUID();await pool.query(`INSERT INTO users(id,organization_id,name,email,password_hash,role) VALUES($1,$2,$3,$4,$5,$6)`,[id,req.portalUser.organization_id,name,email,hashSecret(password),role]);res.status(201).json({id,name,email,role})}
-  catch(e){if(e.code==='23505')return res.status(409).json({error:'E-postadressen används redan'});throw e}
+  catch(e){if(e.code==='23505')return res.status(409).json({error:'Email address is already in use'});throw e}
 });
 app.patch('/api/portal/users/:id',requireCustomerAdmin,async(req,res)=>{
   const current=(await pool.query('SELECT id,role,active FROM users WHERE id=$1 AND organization_id=$2',[req.params.id,req.portalUser.organization_id])).rows[0];
-  if(!current)return res.status(404).json({error:'Användaren finns inte'});
+  if(!current)return res.status(404).json({error:'User not found'});
   const fields=[],vals=[];
   if(Object.hasOwn(req.body,'name')){vals.push(String(req.body.name||'').trim().slice(0,100));fields.push(`name=$${vals.length}`)}
   if(Object.hasOwn(req.body,'email')){vals.push(normalizeEmail(req.body.email));fields.push(`email=$${vals.length}`)}
-  if(Object.hasOwn(req.body,'role')){const role=String(req.body.role);if(!['customer_admin','event_admin'].includes(role))return res.status(400).json({error:'Ogiltig kundroll'});vals.push(role);fields.push(`role=$${vals.length}`)}
+  if(Object.hasOwn(req.body,'role')){const role=String(req.body.role);if(!['customer_admin','event_admin'].includes(role))return res.status(400).json({error:'Invalid customer role'});vals.push(role);fields.push(`role=$${vals.length}`)}
   if(Object.hasOwn(req.body,'active')){vals.push(!!req.body.active);fields.push(`active=$${vals.length}`)}
   if(!fields.length)return res.json({ok:true}); vals.push(req.params.id,req.portalUser.organization_id);
-  try{await pool.query(`UPDATE users SET ${fields.join(',')} WHERE id=$${vals.length-1} AND organization_id=$${vals.length}`,vals);res.json({ok:true})}catch(e){if(e.code==='23505')return res.status(409).json({error:'E-postadressen används redan'});throw e}
+  try{await pool.query(`UPDATE users SET ${fields.join(',')} WHERE id=$${vals.length-1} AND organization_id=$${vals.length}`,vals);res.json({ok:true})}catch(e){if(e.code==='23505')return res.status(409).json({error:'Email address is already in use'});throw e}
 });
 app.post('/api/portal/users/:id/password',requireCustomerAdmin,async(req,res)=>{
-  const password=String(req.body.password||'');if(password.length<8)return res.status(400).json({error:'Lösenordet måste vara minst 8 tecken'});
+  const password=String(req.body.password||'');if(password.length<8)return res.status(400).json({error:'Password must be at least 8 characters'});
   const r=await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2 AND organization_id=$3',[hashSecret(password),req.params.id,req.portalUser.organization_id]);
-  if(!r.rowCount)return res.status(404).json({error:'Användaren finns inte'});res.json({ok:true})
+  if(!r.rowCount)return res.status(404).json({error:'User not found'});res.json({ok:true})
 });
 
 // Wolcom HQ
@@ -294,10 +323,20 @@ app.post('/api/hq/login',async (req,res)=>{
     res.setHeader('Set-Cookie',`wolcom_hq=${encodeURIComponent(signedSession({type:'hq',legacy:true,user:adminUser}))}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=43200`);
     return res.json({ok:true,user:{name:'Bootstrap admin',username:adminUser,role:'owner',legacy:true}});
   }
-  return res.status(401).json({error:'Fel användarnamn/e-post eller lösenord'});
+  return res.status(401).json({error:'Wrong username/email or password'});
 });
 app.post('/api/hq/logout',(_req,res)=>{res.setHeader('Set-Cookie','wolcom_hq=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0');res.json({ok:true})});
 app.get('/api/hq/me',async (req,res)=>{const u=await getHqUser(req);res.json({authenticated:!!u,user:u||null,version})});
+app.post('/api/hq/password',requireHq,async(req,res)=>{
+  if(req.hqUser.legacy)return res.status(409).json({error:'Bootstrap admin password is managed in the server configuration. Create a personal HQ account to change passwords here.'});
+  const currentPassword=String(req.body.current_password||''); const newPassword=String(req.body.new_password||'');
+  if(newPassword.length<10)return res.status(400).json({error:'New password must be at least 10 characters'});
+  const {rows}=await pool.query('SELECT password_hash FROM hq_users WHERE id=$1',[req.hqUser.id]);
+  if(!rows[0]||!verifySecret(currentPassword,rows[0].password_hash))return res.status(403).json({error:'Current password is incorrect'});
+  if(verifySecret(newPassword,rows[0].password_hash))return res.status(400).json({error:'New password must be different from the current password'});
+  await pool.query('UPDATE hq_users SET password_hash=$1 WHERE id=$2',[hashSecret(newPassword),req.hqUser.id]);
+  res.json({ok:true});
+});
 
 app.get('/api/hq/users',requireHq,async (_req,res)=>{
   const {rows}=await pool.query(`SELECT id,name,email,username,role,active,last_login,created_at FROM hq_users ORDER BY active DESC,name`);
@@ -305,34 +344,34 @@ app.get('/api/hq/users',requireHq,async (_req,res)=>{
 });
 app.post('/api/hq/users',requireOwner,async (req,res)=>{
   const name=String(req.body.name||'').trim().slice(0,100),email=normalizeEmail(req.body.email),username=String(req.body.username||'').trim().toLowerCase().replace(/[^a-z0-9._-]/g,'').slice(0,60),password=String(req.body.password||''),role=String(req.body.role||'admin');
-  if(!name||!email||!username||password.length<10)return res.status(400).json({error:'Namn, e-post, användarnamn och lösenord (minst 10 tecken) krävs'});
-  if(!['owner','admin','support'].includes(role))return res.status(400).json({error:'Ogiltig HQ-roll'});
+  if(!name||!email||!username||password.length<10)return res.status(400).json({error:'Name, email, username and password (minimum 10 characters) are required'});
+  if(!['owner','admin','support'].includes(role))return res.status(400).json({error:'Invalid HQ role'});
   try{const id=crypto.randomUUID();await pool.query(`INSERT INTO hq_users(id,name,email,username,password_hash,role) VALUES($1,$2,$3,$4,$5,$6)`,[id,name,email,username,hashSecret(password),role]);res.status(201).json({id,name,email,username,role})}
-  catch(e){if(e.code==='23505')return res.status(409).json({error:'E-post eller användarnamn finns redan'});throw e}
+  catch(e){if(e.code==='23505')return res.status(409).json({error:'Email or username already exists'});throw e}
 });
 app.patch('/api/hq/users/:id',requireHq,async (req,res)=>{
-  const current=(await pool.query('SELECT id,role,active FROM hq_users WHERE id=$1',[req.params.id])).rows[0]; if(!current)return res.status(404).json({error:'HQ-användaren finns inte'});
-  if(Object.hasOwn(req.body,'role') && req.hqUser.role!=='owner') return res.status(403).json({error:'Endast Owner kan ändra HQ-roll'});
-  if(Object.hasOwn(req.body,'active') && req.hqUser.role!=='owner') return res.status(403).json({error:'Endast Owner kan aktivera/inaktivera HQ-användare'});
+  const current=(await pool.query('SELECT id,role,active FROM hq_users WHERE id=$1',[req.params.id])).rows[0]; if(!current)return res.status(404).json({error:'HQ user not found'});
+  if(Object.hasOwn(req.body,'role') && req.hqUser.role!=='owner') return res.status(403).json({error:'Only an Owner can change HQ roles'});
+  if(Object.hasOwn(req.body,'active') && req.hqUser.role!=='owner') return res.status(403).json({error:'Only an Owner can enable or disable HQ users'});
   const nextRole=Object.hasOwn(req.body,'role')?String(req.body.role):current.role, nextActive=Object.hasOwn(req.body,'active')?!!req.body.active:current.active;
-  if(current.role==='owner' && current.active && (nextRole!=='owner'||!nextActive)){const c=(await pool.query("SELECT count(*)::int n FROM hq_users WHERE role='owner' AND active=true")).rows[0].n;if(c<=1)return res.status(409).json({error:'Den sista aktiva Owner-användaren kan inte nedgraderas eller stängas av'});}
+  if(current.role==='owner' && current.active && (nextRole!=='owner'||!nextActive)){const c=(await pool.query("SELECT count(*)::int n FROM hq_users WHERE role='owner' AND active=true")).rows[0].n;if(c<=1)return res.status(409).json({error:'The last active Owner cannot be downgraded or disabled'});}
   const fields=[],vals=[];
   for(const k of ['name','email','username','role','active']) if(Object.hasOwn(req.body,k)){
-    let v=req.body[k]; if(k==='email')v=normalizeEmail(v); if(k==='username')v=String(v||'').trim().toLowerCase().replace(/[^a-z0-9._-]/g,'').slice(0,60); if(k==='role'&&!['owner','admin','support'].includes(String(v)))return res.status(400).json({error:'Ogiltig HQ-roll'});
+    let v=req.body[k]; if(k==='email')v=normalizeEmail(v); if(k==='username')v=String(v||'').trim().toLowerCase().replace(/[^a-z0-9._-]/g,'').slice(0,60); if(k==='role'&&!['owner','admin','support'].includes(String(v)))return res.status(400).json({error:'Invalid HQ role'});
     vals.push(v); fields.push(`${k}=$${vals.length}`)
   }
   if(!fields.length)return res.json({ok:true}); vals.push(req.params.id);
-  try{await pool.query(`UPDATE hq_users SET ${fields.join(',')} WHERE id=$${vals.length}`,vals);res.json({ok:true})}catch(e){if(e.code==='23505')return res.status(409).json({error:'E-post eller användarnamn finns redan'});throw e}
+  try{await pool.query(`UPDATE hq_users SET ${fields.join(',')} WHERE id=$${vals.length}`,vals);res.json({ok:true})}catch(e){if(e.code==='23505')return res.status(409).json({error:'Email or username already exists'});throw e}
 });
-app.post('/api/hq/users/:id/password',requireHq,async (req,res)=>{const password=String(req.body.password||'');if(password.length<10)return res.status(400).json({error:'Lösenordet måste vara minst 10 tecken'});await pool.query('UPDATE hq_users SET password_hash=$1 WHERE id=$2',[hashSecret(password),req.params.id]);res.json({ok:true})});
+app.post('/api/hq/users/:id/password',requireHq,async (req,res)=>{const password=String(req.body.password||'');if(password.length<10)return res.status(400).json({error:'Password must be at least 10 characters'});await pool.query('UPDATE hq_users SET password_hash=$1 WHERE id=$2',[hashSecret(password),req.params.id]);res.json({ok:true})});
 
 app.get('/api/hq/organizations',requireHq,async (_req,res)=>{const {rows}=await pool.query(`SELECT o.*,count(DISTINCT u.id)::int user_count,count(DISTINCT e.id)::int event_count FROM organizations o LEFT JOIN users u ON u.organization_id=o.id LEFT JOIN events e ON e.organization_id=o.id GROUP BY o.id ORDER BY (o.kind='internal') DESC,o.name`);res.json(rows)});
-app.post('/api/hq/organizations',requireHq,async (req,res)=>{const name=String(req.body.name||'').trim().slice(0,100),slug=slugify(req.body.slug||name);if(!name||!slug)return res.status(400).json({error:'Name required'});try{const id=crypto.randomUUID(),cn=String(req.body.customer_number||'').trim().slice(0,40),on=String(req.body.organization_number||'').trim().slice(0,40),ce=normalizeEmail(req.body.contact_email),be=normalizeEmail(req.body.billing_email);await pool.query(`INSERT INTO organizations(id,name,slug,kind,customer_number,organization_number,contact_name,contact_email,contact_phone,billing_email,billing_address,notes,plan,subscription_status,max_events,max_participants) VALUES($1,$2,$3,'customer',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,[id,name,slug,cn,on,String(req.body.contact_name||'').slice(0,100),ce,String(req.body.contact_phone||'').slice(0,60),be,String(req.body.billing_address||'').slice(0,500),String(req.body.notes||'').slice(0,2000),String(req.body.plan||'event').slice(0,40),String(req.body.subscription_status||'manual').slice(0,40),req.body.max_events?Number(req.body.max_events):null,req.body.max_participants?Number(req.body.max_participants):null]);res.status(201).json({id,name,slug})}catch(e){if(e.code==='23505')return res.status(409).json({error:'Customer slug already exists'});throw e}});
-app.patch('/api/hq/organizations/:id',requireHq,async(req,res)=>{const allowed=['name','customer_number','organization_number','contact_name','contact_email','contact_phone','billing_email','billing_address','notes','plan','subscription_status','max_events','max_participants','active'];const sets=[],vals=[];for(const k of allowed)if(Object.hasOwn(req.body,k)){vals.push(req.body[k]===''?null:req.body[k]);sets.push(`${k}=$${vals.length}`)}if(!sets.length)return res.json({ok:true});vals.push(req.params.id);await pool.query(`UPDATE organizations SET ${sets.join(',')} WHERE id=$${vals.length}`,vals);res.json({ok:true})});
+app.post('/api/hq/organizations',requireHq,async (req,res)=>{const name=String(req.body.name||'').trim().slice(0,100),slug=slugify(req.body.slug||name);if(!name||!slug)return res.status(400).json({error:'Name required'});try{const id=crypto.randomUUID(),cn=String(req.body.customer_number||'').trim().slice(0,40)||await nextCustomerNumber(),on=String(req.body.organization_number||'').trim().slice(0,40),ce=normalizeEmail(req.body.contact_email),be=normalizeEmail(req.body.billing_email);await pool.query(`INSERT INTO organizations(id,name,slug,kind,customer_number,organization_number,contact_name,contact_email,contact_phone,billing_email,billing_address,notes,plan,subscription_status,max_events,max_participants) VALUES($1,$2,$3,'customer',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,[id,name,slug,cn,on,String(req.body.contact_name||'').slice(0,100),ce,String(req.body.contact_phone||'').slice(0,60),be,String(req.body.billing_address||'').slice(0,500),String(req.body.notes||'').slice(0,2000),String(req.body.plan||'event').slice(0,40),String(req.body.subscription_status||'manual').slice(0,40),req.body.max_events?Number(req.body.max_events):null,req.body.max_participants?Number(req.body.max_participants):null]);res.status(201).json({id,name,slug,customer_number:cn})}catch(e){if(e.code==='23505')return res.status(409).json({error:'Customer slug or customer number already exists'});throw e}});
+app.patch('/api/hq/organizations/:id',requireHq,async(req,res)=>{const allowed=['name','organization_number','contact_name','contact_email','contact_phone','billing_email','billing_address','notes','plan','subscription_status','max_events','max_participants','active'];const sets=[],vals=[];for(const k of allowed)if(Object.hasOwn(req.body,k)){vals.push(req.body[k]===''?null:req.body[k]);sets.push(`${k}=$${vals.length}`)}if(!sets.length)return res.json({ok:true});vals.push(req.params.id);await pool.query(`UPDATE organizations SET ${sets.join(',')} WHERE id=$${vals.length}`,vals);res.json({ok:true})});
 app.get('/api/hq/organizations/:id/users',requireHq,async(req,res)=>{const {rows}=await pool.query(`SELECT id,name,email,role,active,last_login,created_at FROM users WHERE organization_id=$1 ORDER BY active DESC,name`,[req.params.id]);res.json(rows)});
-app.post('/api/hq/organizations/:id/users',requireHq,async (req,res)=>{const name=String(req.body.name||'').trim().slice(0,100),email=normalizeEmail(req.body.email),password=String(req.body.password||''),role=String(req.body.role||'customer_admin');if(!name||!email||password.length<8)return res.status(400).json({error:'Namn, e-post och lösenord (minst 8 tecken) krävs'});if(!['customer_admin','event_admin'].includes(role))return res.status(400).json({error:'Ogiltig kundroll'});try{const id=crypto.randomUUID();await pool.query(`INSERT INTO users(id,organization_id,name,email,password_hash,role) VALUES($1,$2,$3,$4,$5,$6)`,[id,req.params.id,name,email,hashSecret(password),role]);res.status(201).json({id,name,email,role})}catch(e){if(e.code==='23505')return res.status(409).json({error:'E-postadressen används redan'});throw e}});
-app.patch('/api/hq/organizations/:orgId/users/:userId',requireHq,async(req,res)=>{const current=(await pool.query('SELECT id FROM users WHERE id=$1 AND organization_id=$2',[req.params.userId,req.params.orgId])).rows[0];if(!current)return res.status(404).json({error:'Kundanvändaren finns inte'});const fields=[],vals=[];if(Object.hasOwn(req.body,'name')){vals.push(String(req.body.name||'').trim().slice(0,100));fields.push(`name=$${vals.length}`)}if(Object.hasOwn(req.body,'email')){vals.push(normalizeEmail(req.body.email));fields.push(`email=$${vals.length}`)}if(Object.hasOwn(req.body,'role')){const role=String(req.body.role);if(!['customer_admin','event_admin'].includes(role))return res.status(400).json({error:'Ogiltig kundroll'});vals.push(role);fields.push(`role=$${vals.length}`)}if(Object.hasOwn(req.body,'active')){vals.push(!!req.body.active);fields.push(`active=$${vals.length}`)}if(!fields.length)return res.json({ok:true});vals.push(req.params.userId,req.params.orgId);try{await pool.query(`UPDATE users SET ${fields.join(',')} WHERE id=$${vals.length-1} AND organization_id=$${vals.length}`,vals);res.json({ok:true})}catch(e){if(e.code==='23505')return res.status(409).json({error:'E-postadressen används redan'});throw e}});
-app.post('/api/hq/organizations/:orgId/users/:userId/password',requireHq,async(req,res)=>{const password=String(req.body.password||'');if(password.length<8)return res.status(400).json({error:'Lösenordet måste vara minst 8 tecken'});const r=await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2 AND organization_id=$3',[hashSecret(password),req.params.userId,req.params.orgId]);if(!r.rowCount)return res.status(404).json({error:'Kundanvändaren finns inte'});res.json({ok:true})});
+app.post('/api/hq/organizations/:id/users',requireHq,async (req,res)=>{const name=String(req.body.name||'').trim().slice(0,100),email=normalizeEmail(req.body.email),password=String(req.body.password||''),role=String(req.body.role||'customer_admin');if(!name||!email||password.length<8)return res.status(400).json({error:'Name, email and password (minimum 8 characters) are required'});if(!['customer_admin','event_admin'].includes(role))return res.status(400).json({error:'Invalid customer role'});try{const id=crypto.randomUUID();await pool.query(`INSERT INTO users(id,organization_id,name,email,password_hash,role) VALUES($1,$2,$3,$4,$5,$6)`,[id,req.params.id,name,email,hashSecret(password),role]);res.status(201).json({id,name,email,role})}catch(e){if(e.code==='23505')return res.status(409).json({error:'Email address is already in use'});throw e}});
+app.patch('/api/hq/organizations/:orgId/users/:userId',requireHq,async(req,res)=>{const current=(await pool.query('SELECT id FROM users WHERE id=$1 AND organization_id=$2',[req.params.userId,req.params.orgId])).rows[0];if(!current)return res.status(404).json({error:'Customer user not found'});const fields=[],vals=[];if(Object.hasOwn(req.body,'name')){vals.push(String(req.body.name||'').trim().slice(0,100));fields.push(`name=$${vals.length}`)}if(Object.hasOwn(req.body,'email')){vals.push(normalizeEmail(req.body.email));fields.push(`email=$${vals.length}`)}if(Object.hasOwn(req.body,'role')){const role=String(req.body.role);if(!['customer_admin','event_admin'].includes(role))return res.status(400).json({error:'Invalid customer role'});vals.push(role);fields.push(`role=$${vals.length}`)}if(Object.hasOwn(req.body,'active')){vals.push(!!req.body.active);fields.push(`active=$${vals.length}`)}if(!fields.length)return res.json({ok:true});vals.push(req.params.userId,req.params.orgId);try{await pool.query(`UPDATE users SET ${fields.join(',')} WHERE id=$${vals.length-1} AND organization_id=$${vals.length}`,vals);res.json({ok:true})}catch(e){if(e.code==='23505')return res.status(409).json({error:'Email address is already in use'});throw e}});
+app.post('/api/hq/organizations/:orgId/users/:userId/password',requireHq,async(req,res)=>{const password=String(req.body.password||'');if(password.length<8)return res.status(400).json({error:'Password must be at least 8 characters'});const r=await pool.query('UPDATE users SET password_hash=$1 WHERE id=$2 AND organization_id=$3',[hashSecret(password),req.params.userId,req.params.orgId]);if(!r.rowCount)return res.status(404).json({error:'Customer user not found'});res.json({ok:true})});
 app.get('/api/hq/events',requireHq,async (_req,res)=>{const {rows}=await pool.query(`SELECT e.id,e.name,e.slug,e.active,e.created_at,e.organization_id,o.name organization_name,o.kind organization_kind,count(c.id)::int channel_count FROM events e JOIN organizations o ON o.id=e.organization_id LEFT JOIN channels c ON c.event_id=e.id GROUP BY e.id,o.id ORDER BY e.created_at DESC`);res.json(rows)});
 app.post('/api/hq/events',requireHq,async (req,res)=>{try{const org=String(req.body.organization_id||'');if(!org)return res.status(400).json({error:'Customer/organization required'});res.status(201).json(await createEvent(org,req.body,{bypassBilling:true}))}catch(e){res.status(e.status||500).json({error:e.message||'Could not create event'})}});
 app.patch('/api/hq/events/:id',requireHq,async (req,res)=>{if(typeof req.body.active==='boolean')await pool.query('UPDATE events SET active=$1 WHERE id=$2',[req.body.active,req.params.id]);if(String(req.body.pin||'').trim().length>=4)await pool.query('UPDATE events SET pin_hash=$1 WHERE id=$2',[hashSecret(String(req.body.pin).trim()),req.params.id]);if(Object.hasOwn(req.body,'organization_id')){const oid=String(req.body.organization_id||'');const org=(await pool.query('SELECT id FROM organizations WHERE id=$1',[oid])).rows[0];if(!org)return res.status(400).json({error:'Ogiltig kund/organisation'});await pool.query('UPDATE events SET organization_id=$1 WHERE id=$2',[oid,req.params.id])}res.json({ok:true})});

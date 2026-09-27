@@ -3,7 +3,7 @@ RUN apk add --no-cache postgresql-client tar gzip
 WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev
-COPY server.mjs backuphub.mjs ./
+COPY server.mjs backuphub.mjs backuphub-github-metadata.mjs ./
 COPY public ./public
 COPY cloud ./cloud
 EXPOSE 3000
