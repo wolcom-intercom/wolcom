@@ -2,6 +2,7 @@ import express from 'express';
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import dns from 'node:dns/promises';
 import { fileURLToPath } from 'node:url';
 import pg from 'pg';
 import { AccessToken } from 'livekit-server-sdk';
@@ -25,6 +26,7 @@ app.set('trust proxy', 1);
 app.use('/api/hq/update/upload', express.raw({type:['application/gzip','application/x-gzip','application/octet-stream'],limit:'250mb'}));
 app.use('/api/hq/branding/logo', express.raw({type:['image/png','image/jpeg','image/webp','application/octet-stream'],limit:'2mb'}));
 app.use('/api/hq/branding/favicon', express.raw({type:['image/png','image/x-icon','image/vnd.microsoft.icon','application/octet-stream'],limit:'512kb'}));
+app.use('/api/portal/branding/logo', express.raw({type:['image/png','image/jpeg','image/webp','application/octet-stream'],limit:'2mb'}));
 // Stripe must receive the exact raw request body for webhook signature verification.
 app.use('/api/cloud/stripe/webhook', express.raw({type:'application/json',limit:'2mb'}));
 app.use(express.json({ limit: '512kb' }));
@@ -163,10 +165,30 @@ async function initDb(){
       favicon_name text,
       updated_at timestamptz NOT NULL DEFAULT now()
     );
+    CREATE TABLE IF NOT EXISTS organization_branding (
+      organization_id uuid PRIMARY KEY REFERENCES organizations(id) ON DELETE CASCADE,
+      logo_data bytea,
+      logo_mime text,
+      logo_name text,
+      theme text NOT NULL DEFAULT 'dark',
+      accent_color text NOT NULL DEFAULT '#ff8400',
+      background_color text,
+      show_powered_by boolean NOT NULL DEFAULT true,
+      updated_at timestamptz NOT NULL DEFAULT now()
+    );
+    CREATE TABLE IF NOT EXISTS custom_domains (
+      id uuid PRIMARY KEY,
+      organization_id uuid NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+      hostname text UNIQUE NOT NULL,
+      verified boolean NOT NULL DEFAULT false,
+      verified_at timestamptz,
+      created_at timestamptz NOT NULL DEFAULT now()
+    );
   `);
   await pool.query(`ALTER TABLE events ADD COLUMN IF NOT EXISTS organization_id uuid REFERENCES organizations(id) ON DELETE RESTRICT`);
   await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login timestamptz`);
-  await pool.query(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS customer_number text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS organization_number text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS contact_name text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS contact_email text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS contact_phone text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS billing_email text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS billing_address text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS notes text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS plan text NOT NULL DEFAULT 'event'; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS subscription_status text NOT NULL DEFAULT 'manual'; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS max_events integer; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS max_participants integer;`);
+  await pool.query(`ALTER TABLE channels ADD COLUMN IF NOT EXISTS icon text; ALTER TABLE channels ADD COLUMN IF NOT EXISTS accent_color text; ALTER TABLE channels ADD COLUMN IF NOT EXISTS description text; ALTER TABLE channels ADD COLUMN IF NOT EXISTS active boolean NOT NULL DEFAULT true; ALTER TABLE channels ADD COLUMN IF NOT EXISTS default_listen boolean NOT NULL DEFAULT false; ALTER TABLE channels ADD COLUMN IF NOT EXISTS default_talk boolean NOT NULL DEFAULT false; ALTER TABLE channels ADD COLUMN IF NOT EXISTS default_pan real NOT NULL DEFAULT 0;`);
+  await pool.query(`ALTER TABLE organizations ADD COLUMN IF NOT EXISTS customer_number text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS organization_number text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS contact_name text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS contact_email text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS contact_phone text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS billing_email text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS billing_address text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS notes text; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS plan text NOT NULL DEFAULT 'event'; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS subscription_status text NOT NULL DEFAULT 'manual'; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS max_events integer; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS max_participants integer; ALTER TABLE organizations ADD COLUMN IF NOT EXISTS max_concurrent_users integer;`);
   await pool.query(`CREATE SEQUENCE IF NOT EXISTS wolcom_customer_number_seq START WITH 1001`);
   const seqState=(await pool.query(`SELECT last_value,is_called FROM wolcom_customer_number_seq`)).rows[0];
   const maxCustomer=(await pool.query(`SELECT COALESCE(MAX(CASE WHEN customer_number ~ '^WOL-[0-9]+$' THEN substring(customer_number from 5)::bigint END),1000) AS n FROM organizations`)).rows[0];
@@ -204,6 +226,22 @@ async function nextCustomerNumber(){
 
 const LOGO_MIMES=new Set(['image/png','image/jpeg','image/webp']);
 const FAVICON_MIMES=new Set(['image/png','image/x-icon','image/vnd.microsoft.icon']);
+
+function normalizeHostname(value){return String(value||'').trim().toLowerCase().replace(/^https?:\/\//,'').split('/')[0].replace(/:\d+$/,'').replace(/\.$/,'').slice(0,253)}
+function validHostname(h){return /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/.test(h)}
+function validHexColor(v){return /^#[0-9a-f]{6}$/i.test(String(v||''))}
+async function tenantBranding(orgId){
+  if(!orgId)return {organization_id:null,theme:'dark',accent_color:'#ff8400',background_color:null,show_powered_by:true,has_logo:false,logo_url:null,updated_at:null};
+  const {rows}=await pool.query(`SELECT organization_id,logo_name,logo_mime,octet_length(logo_data) logo_bytes,theme,accent_color,background_color,show_powered_by,updated_at FROM organization_branding WHERE organization_id=$1`,[orgId]);
+  const b=rows[0]||{}; return {organization_id:orgId,theme:['dark','light'].includes(b.theme)?b.theme:'dark',accent_color:validHexColor(b.accent_color)?b.accent_color:'#ff8400',background_color:validHexColor(b.background_color)?b.background_color:null,show_powered_by:b.show_powered_by!==false,has_logo:!!b.logo_bytes,logo_name:b.logo_name||null,logo_mime:b.logo_mime||null,logo_url:b.logo_bytes?`/tenant/logo/${orgId}`:null,updated_at:b.updated_at||null};
+}
+async function tenantOrgFromRequest(req){
+  const host=normalizeHostname(req.hostname||req.headers.host||'');
+  const d=(await pool.query(`SELECT o.id,o.name,o.slug,o.customer_number FROM custom_domains d JOIN organizations o ON o.id=d.organization_id WHERE d.hostname=$1 AND d.verified=true AND o.active=true`,[host])).rows[0];
+  if(d)return d;
+  const p=await portalSession(req); if(p)return {id:p.organization_id,name:p.organization_name,slug:p.organization_slug,customer_number:p.organization_customer_number};
+  return null;
+}
 async function brandingRow(){
   const {rows}=await pool.query(`SELECT logo_mime,logo_name,octet_length(logo_data) logo_bytes,favicon_mime,favicon_name,octet_length(favicon_data) favicon_bytes,updated_at FROM branding_settings WHERE id=1`);
   return rows[0]||{};
@@ -217,39 +255,48 @@ app.delete('/api/hq/branding/logo',requireHq,async (_req,res)=>{await pool.query
 app.post('/api/hq/branding/favicon',requireHq,async (req,res)=>{let mime=String(req.headers['content-type']||'').split(';')[0].trim().toLowerCase();if(mime==='application/octet-stream')mime='image/x-icon';const name=String(req.headers['x-file-name']||'favicon').slice(0,180);if(!Buffer.isBuffer(req.body)||req.body.length<4)return res.status(400).json({error:'Tom eller ogiltig faviconfil'});if(req.body.length>512*1024)return res.status(413).json({error:'Favicon får vara max 512 KB'});if(!FAVICON_MIMES.has(mime))return res.status(415).json({error:'Favicon måste vara PNG eller ICO'});await pool.query(`INSERT INTO branding_settings(id,favicon_data,favicon_mime,favicon_name,updated_at) VALUES(1,$1,$2,$3,now()) ON CONFLICT(id) DO UPDATE SET favicon_data=EXCLUDED.favicon_data,favicon_mime=EXCLUDED.favicon_mime,favicon_name=EXCLUDED.favicon_name,updated_at=now()`,[req.body,mime,name]);res.json({ok:true,name,mime,bytes:req.body.length})});
 app.delete('/api/hq/branding/favicon',requireHq,async (_req,res)=>{await pool.query(`INSERT INTO branding_settings(id,updated_at) VALUES(1,now()) ON CONFLICT(id) DO UPDATE SET favicon_data=NULL,favicon_mime=NULL,favicon_name=NULL,updated_at=now()`);res.json({ok:true})});
 
+app.get('/api/tenant/branding',async(req,res)=>{try{const o=await tenantOrgFromRequest(req);if(!o)return res.json({tenant:false,branding:await tenantBranding(null)});res.json({tenant:true,organization:o,branding:await tenantBranding(o.id)})}catch{res.status(500).json({error:'Tenant branding unavailable'})}});
+app.get('/tenant/logo/:orgId',async(req,res)=>{try{const {rows}=await pool.query('SELECT logo_data,logo_mime,updated_at FROM organization_branding WHERE organization_id=$1',[req.params.orgId]);const b=rows[0];if(!b?.logo_data)return res.status(404).end();res.setHeader('Content-Type',b.logo_mime||'image/png');res.setHeader('Cache-Control','public,max-age=300');res.send(b.logo_data)}catch{res.status(404).end()}});
+
+
 app.get('/api/health', async (_req,res)=>{
   try { await pool.query('SELECT 1'); res.json({ok:true,service:'wolcom',version,livekit:livekitUrl}); }
   catch { res.status(503).json({ok:false,service:'wolcom',version,error:'database unavailable'}); }
 });
 app.get('/api/public/event/:slug', async (req,res)=>{
-  const {rows}=await pool.query(`SELECT e.name,e.slug,e.active,o.name organization_name FROM events e JOIN organizations o ON o.id=e.organization_id WHERE e.slug=$1`,[req.params.slug]);
+  const {rows}=await pool.query(`SELECT e.name,e.slug,e.active,e.organization_id,o.name organization_name FROM events e JOIN organizations o ON o.id=e.organization_id WHERE e.slug=$1`,[req.params.slug]);
   if(!rows[0]||!rows[0].active) return res.status(404).json({error:'Event not found'});
-  res.json(rows[0]);
+  const host=normalizeHostname(req.hostname||req.headers.host||''); const bound=(await pool.query('SELECT organization_id FROM custom_domains WHERE hostname=$1 AND verified=true',[host])).rows[0];
+  if(bound&&bound.organization_id!==rows[0].organization_id)return res.status(404).json({error:'Event not found'});
+  res.json({...rows[0],branding:await tenantBranding(rows[0].organization_id)});
 });
 app.post('/api/join/:slug', async (req,res)=>{
   const name=String(req.body.name||'').trim().slice(0,48); const pin=String(req.body.pin||'').trim();
   if(!name) return res.status(400).json({error:'Name required'});
   const {rows}=await pool.query(`SELECT e.*,o.name organization_name FROM events e JOIN organizations o ON o.id=e.organization_id WHERE e.slug=$1 AND e.active=true AND o.active=true`,[req.params.slug]);
   const event=rows[0];
+  const host=normalizeHostname(req.hostname||req.headers.host||''); const bound=(await pool.query('SELECT organization_id FROM custom_domains WHERE hostname=$1 AND verified=true',[host])).rows[0];
+  if(bound&&event&&bound.organization_id!==event.organization_id)return res.status(401).json({error:'Wrong PIN or inactive event'});
   if(!event || !verifySecret(pin,event.pin_hash)) return res.status(401).json({error:'Wrong PIN or inactive event'});
-  const cr=await pool.query('SELECT id,name,position FROM channels WHERE event_id=$1 ORDER BY position,name',[event.id]);
+  const cr=await pool.query('SELECT id,name,position,icon,accent_color,description,active,default_listen,default_talk,default_pan FROM channels WHERE event_id=$1 AND active=true ORDER BY position,name',[event.id]);
   const identity=`${name.replace(/[^\p{L}\p{N}_. -]/gu,'').slice(0,32)}-${crypto.randomBytes(3).toString('hex')}`;
   const at=new AccessToken(process.env.LIVEKIT_API_KEY,process.env.LIVEKIT_API_SECRET,{identity,name,ttl:'8h'});
   at.addGrant({roomJoin:true,room:`event-${event.id}`,canPublish:true,canSubscribe:true,canPublishData:true});
-  res.json({token:await at.toJwt(),livekitUrl,event:{id:event.id,name:event.name,slug:event.slug,organization_name:event.organization_name},channels:cr.rows,identity});
+  res.json({token:await at.toJwt(),livekitUrl,event:{id:event.id,name:event.name,slug:event.slug,organization_name:event.organization_name,organization_id:event.organization_id,branding:await tenantBranding(event.organization_id)},channels:cr.rows,identity});
 });
 
 // Customer / renter portal
 app.post('/api/portal/login',async (req,res)=>{
   const email=normalizeEmail(req.body.email); const password=String(req.body.password||'');
-  const {rows}=await pool.query(`SELECT u.id,u.password_hash,u.active,o.active organization_active FROM users u JOIN organizations o ON o.id=u.organization_id WHERE lower(u.email)=$1`,[email]);
+  const {rows}=await pool.query(`SELECT u.id,u.organization_id,u.password_hash,u.active,o.active organization_active FROM users u JOIN organizations o ON o.id=u.organization_id WHERE lower(u.email)=$1`,[email]);
   const u=rows[0]; if(!u||!u.active||!u.organization_active||!verifySecret(password,u.password_hash)) return res.status(401).json({error:'Wrong email or password'});
+  const host=normalizeHostname(req.hostname||req.headers.host||''); const bound=(await pool.query('SELECT organization_id FROM custom_domains WHERE hostname=$1 AND verified=true',[host])).rows[0]; if(bound&&bound.organization_id!==u.organization_id)return res.status(403).json({error:'This login belongs to a different Wolcom organization'});
   await pool.query('UPDATE users SET last_login=now() WHERE id=$1',[u.id]);
   res.setHeader('Set-Cookie',`wolcom_portal=${encodeURIComponent(signedSession({type:'portal',uid:u.id}))}; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=43200`);
   res.json({ok:true});
 });
 app.post('/api/portal/logout',(_req,res)=>{res.setHeader('Set-Cookie','wolcom_portal=; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=0');res.json({ok:true})});
-app.get('/api/portal/me',async (req,res)=>{const u=await portalSession(req);res.json({authenticated:!!u,user:u?{id:u.id,name:u.name,email:u.email,role:u.role,organization:{id:u.organization_id,name:u.organization_name,slug:u.organization_slug,customer_number:u.organization_customer_number}}:null,version})});
+app.get('/api/portal/me',async (req,res)=>{const u=await portalSession(req);let orgExtra=null;if(u){orgExtra=(await pool.query('SELECT max_concurrent_users FROM organizations WHERE id=$1',[u.organization_id])).rows[0]||{};}res.json({authenticated:!!u,user:u?{id:u.id,name:u.name,email:u.email,role:u.role,organization:{id:u.organization_id,name:u.organization_name,slug:u.organization_slug,customer_number:u.organization_customer_number,max_concurrent_users:orgExtra?.max_concurrent_users||null,branding:await tenantBranding(u.organization_id)}}:null,version})});
 app.post('/api/portal/password',requirePortal,async(req,res)=>{
   const currentPassword=String(req.body.current_password||''); const newPassword=String(req.body.new_password||'');
   if(newPassword.length<8)return res.status(400).json({error:'New password must be at least 8 characters'});
@@ -265,7 +312,7 @@ app.get('/api/portal/events',requirePortal,async (req,res)=>{
 app.post('/api/portal/events',requireCustomerAdmin,async (req,res)=>{try{res.status(201).json(await createEvent(req.portalUser.organization_id,req.body))}catch(e){res.status(e.status||500).json({error:e.message||'Could not create event'})}});
 app.get('/api/portal/events/:id',requirePortal,async (req,res)=>{
   const er=await pool.query('SELECT id,name,slug,active,created_at FROM events WHERE id=$1 AND organization_id=$2',[req.params.id,req.portalUser.organization_id]); if(!er.rows[0])return res.status(404).json({error:'Not found'});
-  const cr=await pool.query('SELECT id,name,position FROM channels WHERE event_id=$1 ORDER BY position,name',[req.params.id]);res.json({...er.rows[0],channels:cr.rows})
+  const cr=await pool.query('SELECT id,name,position,icon,accent_color,description,active,default_listen,default_talk,default_pan FROM channels WHERE event_id=$1 ORDER BY position,name',[req.params.id]);res.json({...er.rows[0],channels:cr.rows})
 });
 app.patch('/api/portal/events/:id',requirePortal,async (req,res)=>{
   const f=await pool.query('SELECT id FROM events WHERE id=$1 AND organization_id=$2',[req.params.id,req.portalUser.organization_id]);if(!f.rows[0])return res.status(404).json({error:'Not found'});
@@ -279,6 +326,24 @@ app.post('/api/portal/events/:id/channels',requirePortal,async (req,res)=>{
 app.delete('/api/portal/events/:eventId/channels/:channelId',requirePortal,async (req,res)=>{
   const f=await pool.query('SELECT id FROM events WHERE id=$1 AND organization_id=$2',[req.params.eventId,req.portalUser.organization_id]);if(!f.rows[0])return res.status(404).json({error:'Not found'});await pool.query('DELETE FROM channels WHERE id=$1 AND event_id=$2',[req.params.channelId,req.params.eventId]);res.json({ok:true})
 });
+
+
+app.patch('/api/portal/events/:eventId/channels/:channelId',requirePortal,async(req,res)=>{
+  const own=(await pool.query('SELECT id FROM events WHERE id=$1 AND organization_id=$2',[req.params.eventId,req.portalUser.organization_id])).rows[0];if(!own)return res.status(404).json({error:'Not found'});
+  const fields=[],vals=[];const map={name:v=>String(v||'').trim().slice(0,80),icon:v=>String(v||'').trim().slice(0,12),description:v=>String(v||'').trim().slice(0,240),accent_color:v=>validHexColor(v)?String(v):null,active:v=>!!v,default_listen:v=>!!v,default_talk:v=>!!v,default_pan:v=>Math.max(-1,Math.min(1,Number(v)||0))};
+  for(const [k,fn] of Object.entries(map))if(Object.hasOwn(req.body,k)){const v=fn(req.body[k]);if(k==='name'&&!v)return res.status(400).json({error:'Channel name is required'});vals.push(v);fields.push(`${k}=$${vals.length}`)}
+  if(!fields.length)return res.json({ok:true});vals.push(req.params.channelId,req.params.eventId);await pool.query(`UPDATE channels SET ${fields.join(',')} WHERE id=$${vals.length-1} AND event_id=$${vals.length}`,vals);res.json({ok:true});
+});
+app.post('/api/portal/events/:eventId/channels/reorder',requirePortal,async(req,res)=>{const own=(await pool.query('SELECT id FROM events WHERE id=$1 AND organization_id=$2',[req.params.eventId,req.portalUser.organization_id])).rows[0];if(!own)return res.status(404).json({error:'Not found'});const ids=Array.isArray(req.body.channel_ids)?req.body.channel_ids.slice(0,64):[];for(let i=0;i<ids.length;i++)await pool.query('UPDATE channels SET position=$1 WHERE id=$2 AND event_id=$3',[i,ids[i],req.params.eventId]);res.json({ok:true})});
+
+app.get('/api/portal/branding',requirePortal,async(req,res)=>res.json(await tenantBranding(req.portalUser.organization_id)));
+app.patch('/api/portal/branding',requireCustomerAdmin,async(req,res)=>{const theme=['dark','light'].includes(String(req.body.theme))?String(req.body.theme):'dark';const accent=validHexColor(req.body.accent_color)?String(req.body.accent_color):'#ff8400';const bg=validHexColor(req.body.background_color)?String(req.body.background_color):null;await pool.query(`INSERT INTO organization_branding(organization_id,theme,accent_color,background_color,show_powered_by,updated_at) VALUES($1,$2,$3,$4,true,now()) ON CONFLICT(organization_id) DO UPDATE SET theme=EXCLUDED.theme,accent_color=EXCLUDED.accent_color,background_color=EXCLUDED.background_color,show_powered_by=true,updated_at=now()`,[req.portalUser.organization_id,theme,accent,bg]);res.json(await tenantBranding(req.portalUser.organization_id))});
+app.post('/api/portal/branding/logo',requireCustomerAdmin,async(req,res)=>{const mime=String(req.headers['content-type']||'').split(';')[0].trim().toLowerCase();const name=String(req.headers['x-file-name']||'logo').slice(0,180);if(!Buffer.isBuffer(req.body)||req.body.length<16)return res.status(400).json({error:'Empty or invalid logo file'});if(req.body.length>2*1024*1024)return res.status(413).json({error:'Logo may be at most 2 MB'});if(!LOGO_MIMES.has(mime))return res.status(415).json({error:'Logo must be PNG, JPG or WebP'});await pool.query(`INSERT INTO organization_branding(organization_id,logo_data,logo_mime,logo_name,updated_at) VALUES($1,$2,$3,$4,now()) ON CONFLICT(organization_id) DO UPDATE SET logo_data=EXCLUDED.logo_data,logo_mime=EXCLUDED.logo_mime,logo_name=EXCLUDED.logo_name,updated_at=now()`,[req.portalUser.organization_id,req.body,mime,name]);res.json({ok:true})});
+app.delete('/api/portal/branding/logo',requireCustomerAdmin,async(req,res)=>{await pool.query(`INSERT INTO organization_branding(organization_id,updated_at) VALUES($1,now()) ON CONFLICT(organization_id) DO UPDATE SET logo_data=NULL,logo_mime=NULL,logo_name=NULL,updated_at=now()`,[req.portalUser.organization_id]);res.json({ok:true})});
+app.get('/api/portal/domains',requirePortal,async(req,res)=>{const {rows}=await pool.query('SELECT id,hostname,verified,verified_at,created_at FROM custom_domains WHERE organization_id=$1 ORDER BY created_at',[req.portalUser.organization_id]);res.json(rows)});
+app.post('/api/portal/domains',requireCustomerAdmin,async(req,res)=>{const hostname=normalizeHostname(req.body.hostname);if(!validHostname(hostname))return res.status(400).json({error:'Enter a valid hostname such as intercom.example.com'});if(hostname.endsWith('.wolcom.se'))return res.status(400).json({error:'wolcom.se hostnames are reserved'});try{const id=crypto.randomUUID();await pool.query('INSERT INTO custom_domains(id,organization_id,hostname) VALUES($1,$2,$3)',[id,req.portalUser.organization_id,hostname]);res.status(201).json({id,hostname,verified:false,cname_target:'call.wolcom.se'})}catch(e){if(e.code==='23505')return res.status(409).json({error:'Domain is already assigned'});throw e}});
+app.post('/api/portal/domains/:id/verify',requireCustomerAdmin,async(req,res)=>{const d=(await pool.query('SELECT id,hostname FROM custom_domains WHERE id=$1 AND organization_id=$2',[req.params.id,req.portalUser.organization_id])).rows[0];if(!d)return res.status(404).json({error:'Domain not found'});let verified=false,answers=[];try{answers=(await dns.resolveCname(d.hostname)).map(normalizeHostname);verified=answers.includes('call.wolcom.se')}catch{}if(verified)await pool.query('UPDATE custom_domains SET verified=true,verified_at=now() WHERE id=$1',[d.id]);res.json({ok:verified,hostname:d.hostname,cname_target:'call.wolcom.se',answers,verified})});
+app.delete('/api/portal/domains/:id',requireCustomerAdmin,async(req,res)=>{await pool.query('DELETE FROM custom_domains WHERE id=$1 AND organization_id=$2',[req.params.id,req.portalUser.organization_id]);res.json({ok:true})});
 
 
 app.get('/api/portal/users',requireCustomerAdmin,async(req,res)=>{
@@ -366,8 +431,8 @@ app.patch('/api/hq/users/:id',requireHq,async (req,res)=>{
 app.post('/api/hq/users/:id/password',requireHq,async (req,res)=>{const password=String(req.body.password||'');if(password.length<10)return res.status(400).json({error:'Password must be at least 10 characters'});await pool.query('UPDATE hq_users SET password_hash=$1 WHERE id=$2',[hashSecret(password),req.params.id]);res.json({ok:true})});
 
 app.get('/api/hq/organizations',requireHq,async (_req,res)=>{const {rows}=await pool.query(`SELECT o.*,count(DISTINCT u.id)::int user_count,count(DISTINCT e.id)::int event_count FROM organizations o LEFT JOIN users u ON u.organization_id=o.id LEFT JOIN events e ON e.organization_id=o.id GROUP BY o.id ORDER BY (o.kind='internal') DESC,o.name`);res.json(rows)});
-app.post('/api/hq/organizations',requireHq,async (req,res)=>{const name=String(req.body.name||'').trim().slice(0,100),slug=slugify(req.body.slug||name);if(!name||!slug)return res.status(400).json({error:'Name required'});try{const id=crypto.randomUUID(),cn=String(req.body.customer_number||'').trim().slice(0,40)||await nextCustomerNumber(),on=String(req.body.organization_number||'').trim().slice(0,40),ce=normalizeEmail(req.body.contact_email),be=normalizeEmail(req.body.billing_email);await pool.query(`INSERT INTO organizations(id,name,slug,kind,customer_number,organization_number,contact_name,contact_email,contact_phone,billing_email,billing_address,notes,plan,subscription_status,max_events,max_participants) VALUES($1,$2,$3,'customer',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,[id,name,slug,cn,on,String(req.body.contact_name||'').slice(0,100),ce,String(req.body.contact_phone||'').slice(0,60),be,String(req.body.billing_address||'').slice(0,500),String(req.body.notes||'').slice(0,2000),String(req.body.plan||'event').slice(0,40),String(req.body.subscription_status||'manual').slice(0,40),req.body.max_events?Number(req.body.max_events):null,req.body.max_participants?Number(req.body.max_participants):null]);res.status(201).json({id,name,slug,customer_number:cn})}catch(e){if(e.code==='23505')return res.status(409).json({error:'Customer slug or customer number already exists'});throw e}});
-app.patch('/api/hq/organizations/:id',requireHq,async(req,res)=>{const allowed=['name','organization_number','contact_name','contact_email','contact_phone','billing_email','billing_address','notes','plan','subscription_status','max_events','max_participants','active'];const sets=[],vals=[];for(const k of allowed)if(Object.hasOwn(req.body,k)){vals.push(req.body[k]===''?null:req.body[k]);sets.push(`${k}=$${vals.length}`)}if(!sets.length)return res.json({ok:true});vals.push(req.params.id);await pool.query(`UPDATE organizations SET ${sets.join(',')} WHERE id=$${vals.length}`,vals);res.json({ok:true})});
+app.post('/api/hq/organizations',requireHq,async (req,res)=>{const name=String(req.body.name||'').trim().slice(0,100),slug=slugify(req.body.slug||name);if(!name||!slug)return res.status(400).json({error:'Name required'});try{const id=crypto.randomUUID(),cn=String(req.body.customer_number||'').trim().slice(0,40)||await nextCustomerNumber(),on=String(req.body.organization_number||'').trim().slice(0,40),ce=normalizeEmail(req.body.contact_email),be=normalizeEmail(req.body.billing_email);await pool.query(`INSERT INTO organizations(id,name,slug,kind,customer_number,organization_number,contact_name,contact_email,contact_phone,billing_email,billing_address,notes,plan,subscription_status,max_events,max_participants,max_concurrent_users) VALUES($1,$2,$3,'customer',$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,[id,name,slug,cn,on,String(req.body.contact_name||'').slice(0,100),ce,String(req.body.contact_phone||'').slice(0,60),be,String(req.body.billing_address||'').slice(0,500),String(req.body.notes||'').slice(0,2000),String(req.body.plan||'event').slice(0,40),String(req.body.subscription_status||'manual').slice(0,40),req.body.max_events?Number(req.body.max_events):null,req.body.max_participants?Number(req.body.max_participants):null,req.body.max_concurrent_users?Number(req.body.max_concurrent_users):null]);res.status(201).json({id,name,slug,customer_number:cn})}catch(e){if(e.code==='23505')return res.status(409).json({error:'Customer slug or customer number already exists'});throw e}});
+app.patch('/api/hq/organizations/:id',requireHq,async(req,res)=>{const allowed=['name','organization_number','contact_name','contact_email','contact_phone','billing_email','billing_address','notes','plan','subscription_status','max_events','max_participants','max_concurrent_users','active'];const sets=[],vals=[];for(const k of allowed)if(Object.hasOwn(req.body,k)){vals.push(req.body[k]===''?null:req.body[k]);sets.push(`${k}=$${vals.length}`)}if(!sets.length)return res.json({ok:true});vals.push(req.params.id);await pool.query(`UPDATE organizations SET ${sets.join(',')} WHERE id=$${vals.length}`,vals);res.json({ok:true})});
 app.get('/api/hq/organizations/:id/users',requireHq,async(req,res)=>{const {rows}=await pool.query(`SELECT id,name,email,role,active,last_login,created_at FROM users WHERE organization_id=$1 ORDER BY active DESC,name`,[req.params.id]);res.json(rows)});
 app.post('/api/hq/organizations/:id/users',requireHq,async (req,res)=>{const name=String(req.body.name||'').trim().slice(0,100),email=normalizeEmail(req.body.email),password=String(req.body.password||''),role=String(req.body.role||'customer_admin');if(!name||!email||password.length<8)return res.status(400).json({error:'Name, email and password (minimum 8 characters) are required'});if(!['customer_admin','event_admin'].includes(role))return res.status(400).json({error:'Invalid customer role'});try{const id=crypto.randomUUID();await pool.query(`INSERT INTO users(id,organization_id,name,email,password_hash,role) VALUES($1,$2,$3,$4,$5,$6)`,[id,req.params.id,name,email,hashSecret(password),role]);res.status(201).json({id,name,email,role})}catch(e){if(e.code==='23505')return res.status(409).json({error:'Email address is already in use'});throw e}});
 app.patch('/api/hq/organizations/:orgId/users/:userId',requireHq,async(req,res)=>{const current=(await pool.query('SELECT id FROM users WHERE id=$1 AND organization_id=$2',[req.params.userId,req.params.orgId])).rows[0];if(!current)return res.status(404).json({error:'Customer user not found'});const fields=[],vals=[];if(Object.hasOwn(req.body,'name')){vals.push(String(req.body.name||'').trim().slice(0,100));fields.push(`name=$${vals.length}`)}if(Object.hasOwn(req.body,'email')){vals.push(normalizeEmail(req.body.email));fields.push(`email=$${vals.length}`)}if(Object.hasOwn(req.body,'role')){const role=String(req.body.role);if(!['customer_admin','event_admin'].includes(role))return res.status(400).json({error:'Invalid customer role'});vals.push(role);fields.push(`role=$${vals.length}`)}if(Object.hasOwn(req.body,'active')){vals.push(!!req.body.active);fields.push(`active=$${vals.length}`)}if(!fields.length)return res.json({ok:true});vals.push(req.params.userId,req.params.orgId);try{await pool.query(`UPDATE users SET ${fields.join(',')} WHERE id=$${vals.length-1} AND organization_id=$${vals.length}`,vals);res.json({ok:true})}catch(e){if(e.code==='23505')return res.status(409).json({error:'Email address is already in use'});throw e}});
